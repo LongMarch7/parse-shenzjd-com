@@ -1,0 +1,235 @@
+/**
+ * 服务端微信认证守卫
+ *
+ * 背景：解析接口强制要求用户已完成「关注公众号 + 验证码」认证（登录才能解析）。
+ * 凭证：wx-auth-sdk 将签名 token 写入根域 Cookie `wxauth-token`（.shenzjd.com 跨子域
+ *       共享），浏览器访问解析接口时自动携带，服务端在此读取并校验。
+ *       小程序端没有 Cookie，登录后通过 Authorization: Bearer <token> 头携带同一
+ *       token（校验链路相同，无需身份特判）；Cookie 优先，无 Cookie 凭证时才取 Bearer。
+ * 校验：远程调 wx-auth 的 /api/auth/check?token=xxx —— 权威校验（查用户表
+ *       active 状态，取关/封禁即失效），不共享密钥。地址与重试见
+ *       lib/wx-auth-endpoint.ts（内网优先，瞬时失败自愈一次）。
+ * 缓存：校验结果按 token 缓存 10 分钟（策略经确认：长缓存减少外部请求，代价是取关后
+ *       最长 10 分钟内仍可解析）；「明确未认证」也缓存（防刷），「认证服务异常」不缓存
+ *       （fail closed 拒绝本次，服务恢复后立即生效）。
+ */
+
+import { wxAuthFetch } from "@/lib/wx-auth-endpoint";
+
+const AUTH_CACHE_TTL_MS = 10 * 60 * 1000;
+const AUTH_CACHE_MAX = 2000;
+// 单次尝试超时。原来 5s 是「一次定生死」，现在允许重试一次（见 wx-auth-endpoint），
+// 故单次收到 2.5s：最坏 2×2.5s+退避 ≈ 原最坏 5s，但单次抖动可自愈。
+const AUTH_FETCH_TIMEOUT_MS = 2500;
+
+interface AuthCacheEntry {
+  authenticated: boolean;
+  expiresAt: number;
+}
+
+const authCache = new Map<string, AuthCacheEntry>();
+
+interface UserInfoCacheEntry {
+  authenticated: boolean;
+  isAdmin: boolean;
+  expiresAt: number;
+}
+
+// 用户详情缓存（isAdmin 变化频率极低，与 check 同款 10 分钟策略）
+const userInfoCache = new Map<string, UserInfoCacheEntry>();
+
+/**
+ * 写缓存（LRU）：超过上限时逐出最旧的一批，而不是整体 clear()。
+ * 原实现「满了就 clear」会造成一次集中的全量回源（所有在线 token 同时重新 check），
+ * 在 10 分钟 TTL 下更容易被触发。
+ */
+function cacheSet<K, V>(map: Map<K, V>, key: K, value: V): void {
+  if (map.size >= AUTH_CACHE_MAX) {
+    const batch = Math.ceil(AUTH_CACHE_MAX / 8);
+    let removed = 0;
+    for (const oldest of map.keys()) {
+      map.delete(oldest);
+      if (++removed >= batch) break;
+    }
+  }
+  map.delete(key);
+  map.set(key, value);
+}
+
+/**
+ * 从请求中提取认证凭证 + **来源通道**：
+ * 1. Cookie `wxauth-token`（网页端 SDK 写入，优先）→ viaBearer=false
+ * 2. 无 Cookie 凭证时取 Authorization: Bearer <token>（小程序端）→ viaBearer=true
+ *
+ * 通道必须保真传递给 wx-auth（2026-10-20 修复）：wx-auth 的网页清退闸门只作用
+ * query/Cookie 通道（3 段 mp: 网页 token 与小程序 token 格式相同，通道是唯一区分）。
+ * 此前本模块把 Bearer 里取出的 token 也改经 `check?token=` query 转发——闸门把
+ * 小程序老 token（10-15 前签发）当成网页 token 全部清退，小程序用户解析恒 401，
+ * 且小程序无法发版修复。现在 Bearer 来源的凭证继续走 Bearer 头转发（豁免闸门），
+ * Cookie 来源照走 query（闸门语义不变）。
+ */
+export interface WxAuthCredential {
+  token: string | null;
+  /** true = 凭证取自 Authorization: Bearer（小程序/服务端代理），转发时保持 Bearer 通道 */
+  viaBearer: boolean;
+}
+
+export function getWxAuthCredential(request: Request): WxAuthCredential {
+  const cookie = request.headers.get("cookie");
+  if (cookie) {
+    const match = cookie.match(/(?:^|;\s*)wxauth-token=([^;]+)/);
+    if (match) {
+      try {
+        return { token: decodeURIComponent(match[1]), viaBearer: false };
+      } catch {
+        return { token: null, viaBearer: false };
+      }
+    }
+  }
+  const bearer = getBearerToken(request);
+  return bearer ? { token: bearer, viaBearer: true } : { token: null, viaBearer: false };
+}
+
+/**
+ * 从请求中提取认证 token（兼容旧调用方）：
+ * 1. Cookie `wxauth-token`（网页端 SDK 写入，优先）
+ * 2. 无 Cookie 凭证时取 Authorization: Bearer <token>（小程序端）
+ * @returns token 或 null（无凭证）
+ */
+export function getWxAuthToken(request: Request): string | null {
+  return getWxAuthCredential(request).token;
+}
+
+/**
+ * 从 Authorization 头提取 Bearer token（scheme 大小写不敏感，去前缀后 trim）
+ */
+function getBearerToken(request: Request): string | null {
+  const authorization = request.headers.get("authorization");
+  if (!authorization) return null;
+  const match = authorization.match(/^\s*bearer\s+(.+)$/i);
+  if (!match) return null;
+  return match[1].trim();
+}
+
+/**
+ * 校验认证 token 是否有效（是否已关注公众号并完成认证）
+ * - 缓存命中（10 分钟内）直接返回缓存结果
+ * - 远程 check：authenticated=true → 缓存并放行
+ * - 明确未认证 → 缓存 false（防刷）
+ * - 认证服务异常 → fail closed 拒绝本次，但不缓存（服务恢复后立即生效）
+ * @param token 认证 token（原文）
+ * @param viaBearer 凭证是否来自 Authorization: Bearer（小程序端）。
+ *                  true 时继续用 Bearer 头转发给 wx-auth（豁免网页清退闸门）；
+ *                  缺省 false 走 query（网页 Cookie 凭证的既有语义）
+ */
+export async function checkWxAuthToken(
+  token: string,
+  opts?: { viaBearer?: boolean }
+): Promise<boolean> {
+  const viaBearer = opts?.viaBearer === true;
+  const cached = authCache.get(token);
+  if (cached && cached.expiresAt > Date.now()) {
+    // LRU：命中重排到队尾，避免高频 token 被冷条目挤掉
+    authCache.delete(token);
+    authCache.set(token, cached);
+    return cached.authenticated;
+  }
+
+  let authenticated = false;
+  let checkError = false;
+  try {
+    const response = await wxAuthFetch(
+      viaBearer ? "/api/auth/check" : `/api/auth/check?token=${encodeURIComponent(token)}`,
+      {
+        headers: {
+          "user-agent": "parse.shenzjd.com/auth-guard",
+          // 通道保真：Bearer 凭证经 Authorization 头转发（wx-auth 按小程序/代理通道
+          // 处理，豁免网页清退闸门）；经 query 转发会被闸门当成网页 token 清退
+          ...(viaBearer ? { authorization: `Bearer ${token}` } : {}),
+        },
+        timeoutMs: AUTH_FETCH_TIMEOUT_MS,
+      }
+    );
+    if (response.ok) {
+      const data = await response.json();
+      authenticated = data?.authenticated === true;
+    } else {
+      checkError = true;
+    }
+  } catch (error) {
+    checkError = true;
+    console.error(
+      "[wx-auth-guard] 认证服务 check 请求失败:",
+      error instanceof Error ? error.message : error
+    );
+  }
+
+  // 认证服务异常不缓存（fail closed 拒绝本次，避免把错误状态缓存 10 分钟）
+  if (!checkError) {
+    cacheSet(authCache, token, {
+      authenticated,
+      expiresAt: Date.now() + AUTH_CACHE_TTL_MS,
+    });
+  }
+  return authenticated;
+}
+
+/**
+ * 查询认证用户详情（含管理员标记），供管理类接口做放权判断。
+ * 走 wx-auth 的 /api/auth/userinfo（签名 token 校验后返回 role/isAdmin 等）。
+ * 缓存策略与 checkWxAuthToken 一致：命中 10 分钟内直接返回；
+ * 服务异常 fail closed（authenticated=false）且不缓存。
+ */
+export async function getWxAuthUser(request: Request): Promise<{
+  authenticated: boolean;
+  isAdmin: boolean;
+}> {
+  const cred = getWxAuthCredential(request);
+  if (!cred.token) return { authenticated: false, isAdmin: false };
+  const token = cred.token;
+
+  const cached = userInfoCache.get(token);
+  if (cached && cached.expiresAt > Date.now()) {
+    return { authenticated: cached.authenticated, isAdmin: cached.isAdmin };
+  }
+
+  let authenticated = false;
+  let isAdmin = false;
+  let checkError = false;
+  try {
+    const response = await wxAuthFetch(
+      cred.viaBearer
+        ? "/api/auth/userinfo"
+        : `/api/auth/userinfo?token=${encodeURIComponent(token)}`,
+      {
+        headers: {
+          "user-agent": "parse.shenzjd.com/auth-guard",
+          ...(cred.viaBearer ? { authorization: `Bearer ${token}` } : {}),
+        },
+        timeoutMs: AUTH_FETCH_TIMEOUT_MS,
+      }
+    );
+    if (response.ok) {
+      const data = await response.json();
+      authenticated = data?.authenticated === true;
+      isAdmin = authenticated && data?.user?.isAdmin === true;
+    } else {
+      checkError = true;
+    }
+  } catch (error) {
+    checkError = true;
+    console.error(
+      "[wx-auth-guard] 用户详情 userinfo 请求失败:",
+      error instanceof Error ? error.message : error
+    );
+  }
+
+  if (!checkError) {
+    cacheSet(userInfoCache, token, {
+      authenticated,
+      isAdmin,
+      expiresAt: Date.now() + AUTH_CACHE_TTL_MS,
+    });
+  }
+  return { authenticated, isAdmin };
+}

@@ -1,0 +1,462 @@
+// 通用 API 中间件函数
+import {
+  getCachedResponse,
+  setCacheResponse,
+  rateLimit,
+  isValidUrl,
+  sanitizeUrl,
+  getClientIP,
+  getCorsHeaders,
+  logger,
+  errorResponse,
+  serverErrorResponse,
+  parseErrorResponse,
+  isBlockedIP,
+  beijingNow,
+} from "@/lib/api-utils";
+import { normalizeResult } from "@/lib/normalize-result";
+import { recordParse } from "@/lib/analytics";
+import { getWxAuthCredential, checkWxAuthToken } from "@/lib/wx-auth-guard";
+import { honeypotResponse } from "@/lib/honeypot";
+import { getResultCache, putResultCache, resultStale } from "@/lib/result-cache";
+
+/**
+ * 安全的状态码 - 确保在 200-599 范围内
+ */
+export function safeStatus(code: number): number {
+  const num = Number(code);
+  if (Number.isNaN(num)) return 500;
+  if (num < 200) return 500;
+  if (num > 599) return 500;
+  return Math.round(num);
+}
+
+export interface ApiHandlerOptions {
+  shouldCache?: boolean;
+  responseHeaders?: Record<string, string>;
+  // 统一入口专用的共享结果缓存（Cloudflare Cache API，跨 isolate，TTL 24h）：
+  // 缓存的是补全 platform 后的最终归一化结果，与 shouldCache 的进程内存缓存隔离；
+  // 命中时探测主直链，明确死链（签名过期）视为未命中重新解析。见 lib/result-cache.js
+  sharedCache?: boolean;
+}
+
+type ParseFunction = (url: string) => Promise<Record<string, unknown> | null> | Record<string, unknown> | null;
+
+// 平台专用路由（/api/douyin 等）的域名白名单（route 名 → 域名后缀 + 中文名）。
+// 与 lib/platforms.ts 的 PLATFORM_INFO.domains/shortDomains 对齐（route 名与平台 key 命名
+// 不完全一致，如 /api/xhs→小红书、/api/ppxia→皮皮虾，故在此集中维护一份按 route 名的映射）。
+// 匹配规则：hostname === d || hostname.endsWith("." + d)，短链域名（v.douyin.com 等）
+// 由主域名 douyin.com 的 endsWith 覆盖，无需重复列出。
+const ROUTE_DOMAIN_MAP: Record<string, { name: string; hosts: string[] }> = {
+  douyin: { name: "抖音", hosts: ["douyin.com", "iesdouyin.com", "snssdk.com", "wtturl.cn"] },
+  bilibili: { name: "哔哩哔哩", hosts: ["bilibili.com", "b23.tv"] },
+  xhs: { name: "小红书", hosts: ["xiaohongshu.com", "xhslink.com", "xhslink.cn"] },
+  kuaishou: { name: "快手", hosts: ["kuaishou.com", "kuaishoup.com"] },
+  weibo: { name: "微博", hosts: ["weibo.com"] },
+  lvzhou: { name: "绿洲", hosts: ["weibo.cn"] },
+  ppxia: { name: "皮皮虾", hosts: ["pipix.com"] },
+  pipigx: { name: "皮皮搞笑", hosts: ["pipigx.com"] },
+  huoshan: { name: "火山", hosts: ["huoshan.com"] },
+  weishi: { name: "微视", hosts: ["weishi.qq.com"] },
+  xigua: { name: "西瓜视频", hosts: ["ixigua.com"] },
+  zuiyou: { name: "最右", hosts: ["izuiyou.com", "xiaochuankeji.com", "xiaochuankeji.cn"] },
+  quanmin: { name: "度小视", hosts: ["quanmin.baidu.com", "xspshare.baidu.com"] },
+  lishipin: { name: "梨视频", hosts: ["pearvideo.com"] },
+  huya: { name: "虎牙", hosts: ["huya.com"] },
+  acfun: { name: "AcFun", hosts: ["acfun.cn"] },
+  meipai: { name: "美拍", hosts: ["meipai.com"] },
+  doupai: { name: "逗拍", hosts: ["doupai.cc"] },
+  quanminkge: { name: "全民K歌", hosts: ["kg.qq.com", "quanmin.kg.qq.com"] },
+  sixroom: { name: "六间房", hosts: ["6.cn"] },
+  xinpianchang: { name: "新片场", hosts: ["xinpianchang.com"] },
+  haokan: { name: "好看视频", hosts: ["haokan.baidu.com", "haokan.hao123.com"] },
+  twitter: { name: "X (Twitter)", hosts: ["twitter.com", "x.com", "t.co"] },
+  tiktok: { name: "TikTok", hosts: ["tiktok.com", "vm.tiktok.com", "vt.tiktok.com"] },
+  qsmusic: { name: "汽水音乐", hosts: ["music.douyin.com", "qishui.douyin.com"] },
+};
+
+// 需强制微信认证的解析类路由 = 23 个平台专用接口 + 统一入口 /api/parse。
+// health/stats/image/engines 等非解析接口是原生路由（不经本中间件），天然不受影响。
+const AUTH_REQUIRED_ROUTES = new Set<string>([
+  ...Object.keys(ROUTE_DOMAIN_MAP),
+  "parse",
+]);
+
+export interface ParseAccessResult {
+  allowed: boolean;
+  /** allowed=false 时的 HTTP 状态与提示文案（调用方负责写响应与日志） */
+  status: number;
+  message: string;
+  /** 认证通过时的用户凭证（调用方如需按用户维度处理可复用），未通过为 null */
+  token: string | null;
+}
+
+/**
+ * 解析接口的访问门禁（微信认证）。
+ * 抽成导出函数是为了让 `/api/parse?source=&id=` 那条旁路也能复用同一口径——
+ * 该分支历史上完全没有鉴权，既是「登录才能解析」的漏洞，也是各类门禁的旁路。
+ */
+export async function enforceParseAccess(
+  request: Request
+): Promise<ParseAccessResult> {
+  const cred = getWxAuthCredential(request);
+  const authenticated = cred.token
+    ? await checkWxAuthToken(cred.token, { viaBearer: cred.viaBearer })
+    : false;
+  if (!authenticated) {
+    // 401 文案按凭证通道区分（2026-10-20 用户反馈：小程序用户被引导「关注公众号」）：
+    // - Cookie 通道（网页端）：网页用户确实需要关注公众号+验证码认证，维持原文案；
+    // - Bearer 通道（小程序原生 / 服务端代理）：mp-login 注册即认证、根本不存在
+    //   「未完成认证」状态，401 只可能是 token 失效（重登可自愈）或 wx-auth 瞬时
+    //   异常（fail-closed），引导关注公众号是完全错误的死胡同文案。
+    const isBearerChannel = cred.viaBearer;
+    return {
+      allowed: false,
+      status: 401,
+      message: isBearerChannel
+        ? "登录状态已失效，请退出小程序重新进入后重试"
+        : "请先关注公众号「神族九帝」并完成认证后使用解析功能",
+      token: null,
+    };
+  }
+  return { allowed: true, status: 200, message: "", token: cred.token };
+}
+
+// 通用 API 处理函数
+export const createApiHandler = (
+  parseFunction: ParseFunction,
+  options: ApiHandlerOptions = {}
+): ((request: Request) => Promise<Response>) => {
+  const {
+    shouldCache = true,
+    responseHeaders = {},
+    sharedCache = false,
+  } = options;
+
+  const extraHeaders = {
+    ...responseHeaders,
+  };
+
+  return async (request: Request): Promise<Response> => {
+    const startTime = Date.now();
+    const corsHeaders = getCorsHeaders(request.headers.get('origin') || '') as Record<string, string>;
+    const headers = { ...corsHeaders, ...extraHeaders };
+
+    // 获取客户端IP
+    const clientIP = getClientIP(request);
+    logger.log(`API request from IP: ${clientIP}`);
+
+    // 平台使用统计：生产环境 logger.log 不输出，这里用 console.log 确保线上可观测。
+    // 从 URL 路径推断平台（如 /api/bilibili -> bilibili），用于排查各平台是否有人使用。
+    // routeMatch 提升到函数级，供成功分支的行为分析记录复用。
+    // 两类不计入：
+    // - 分平台路由（ROUTE_DOMAIN_MAP 命中）：它们在下方一律 403，不存在真实解析
+    //   ——线上日志里这类直连/扫描流量曾占 usage 六成，污染统计；
+    // - route=parse：本函数内每个请求都已写一条 [parse] 流水（字段完全覆盖 usage），
+    //   再写一行等于每请求两次同步 stdout 写，纯重复开销（2026-09-23 削减日志 I/O）。
+    let routeMatch: RegExpMatchArray | null = null;
+    try {
+      const pathname = new URL(request.url).pathname;
+      routeMatch = pathname.match(/\/api\/([a-z0-9]+)/i);
+      const usageRoute = String(routeMatch?.[1] || "");
+      if (routeMatch && usageRoute !== "parse" && !ROUTE_DOMAIN_MAP[usageRoute]) {
+        console.log(
+          `[usage] route=${usageRoute} time=${beijingNow()}`
+        );
+      }
+    } catch {
+      // 日志失败不影响主流程
+    }
+
+    // 分平台专用接口（/api/douyin、/api/xhs 等）对外一律拒绝：
+    // 解析函数已下沉 lib/parsers/，统一入口 /api/parse 直接函数调用，
+    // 不存在"内部转发"——因此这里不再有任何头/参数可以绕过 403
+    // （旧版用客户端可伪造的 x-parse-internal 头区分内外，已被废除）。
+    // 统一入口 /api/parse 本身不在映射表内，正常放行。
+    const routeName = String(routeMatch?.[1] || "");
+    if (routeName && routeName !== "parse" && ROUTE_DOMAIN_MAP[routeName]) {
+      logger.warn(
+        `分平台接口对外访问被拒绝: route=${routeName} ip=${clientIP}`
+      );
+      return Response.json(
+        {
+          code: 403,
+          msg: "该接口已合并到统一解析入口，请改用 /api/parse?url=<分享链接>",
+        },
+        {
+          status: 403,
+          headers,
+        }
+      );
+    }
+
+    // IP 黑名单拦截（蜜罐模式）：绕过前端、预调解析接口的爬虫/脚本（名单见 api-utils.js）。
+    // 命中不再 403 拒绝，而是返回 200 + 结构化蜜罐数据（宣传公众号），
+    // 让脚本误以为抓取成功、继续消费，实际拿到的是引导文案（见 lib/honeypot.ts）。
+    // 放在 rateLimit 之前（静态 Set/前缀查询零成本）。
+    if (isBlockedIP(clientIP)) {
+      logger.warn(`黑名单 IP 命中蜜罐: ip=${clientIP} route=${String(routeMatch?.[1] || "")}`);
+      const honeypot = normalizeResult(honeypotResponse(String(routeMatch?.[1] || "")));
+      return Response.json(honeypot, {
+        status: 200,
+        headers,
+      });
+    }
+
+    // 每次解析打印一条流水日志（console.log 保证生产环境也输出，对齐 [usage] 风格；
+    // logger.log 仅开发环境输出，成功解析在生产上会没日志）
+    const logParse = (
+      status: string,
+      code: number | string,
+      durationMs: number,
+      reason?: string
+    ) => {
+      const route = String(routeMatch?.[1] || "");
+      const safeUrl = sanitizedUrl || "";
+      const shortUrl =
+        safeUrl.length > 60 ? safeUrl.slice(0, 60) + "..." : safeUrl;
+      console.log(
+        `[parse] route=${route} time=${beijingNow()} url=${shortUrl} status=${status} code=${code} duration=${durationMs}ms${
+          reason ? ` reason=${reason.slice(0, 80)}` : ""
+        }`
+      );
+    };
+
+    // 检查速率限制
+    if (!rateLimit(clientIP)) {
+      return Response.json(
+        errorResponse("请求过于频繁，请稍后再试", 429),
+        {
+          status: safeStatus(429),
+          headers
+        }
+      );
+    }
+
+    const { searchParams } = new URL(request.url);
+    const url = searchParams.get("url");
+
+    if (!url) {
+      return Response.json(
+        errorResponse("url为空", 400),
+        {
+          status: safeStatus(400),
+          headers
+        }
+      );
+    }
+
+    // 验证URL格式
+    if (!isValidUrl(url)) {
+      return Response.json(
+        errorResponse("无效的URL格式", 400),
+        {
+          status: safeStatus(400),
+          headers
+        }
+      );
+    }
+
+    // 安全检查：防止SSRF攻击
+    const sanitizedUrl = sanitizeUrl(url);
+    if (!sanitizedUrl) {
+      logger.warn(`SSRF attempt blocked from IP: ${clientIP}, URL: ${url.substring(0, 100)}`);
+      return Response.json(
+        errorResponse("URL包含不允许访问的地址", 400),
+        {
+          status: safeStatus(400),
+          headers
+        }
+      );
+    }
+
+    // 平台域名白名单校验：/api/douyin 等专用接口只接受本平台域名链接。
+    // 否则任意 URL（如 threads.com）都会被当成抖音尝试解析——先 fetch 外部站、
+    // 再报「无法提取视频 ID」，白费流量且报错误导。
+    // 当前平台路由在上方已一律 403，本检查实际不可达；保留作为防线：
+    // 若未来放开某平台路由对外访问（带认证），白名单立即生效。
+    // 统一入口（/api/parse）不在映射表内，跳过（已有 identifyPlatform 校验）。
+    const routeDomain = ROUTE_DOMAIN_MAP[routeName];
+    if (routeDomain) {
+      try {
+        const hostname = new URL(sanitizedUrl).hostname.toLowerCase();
+        const isAllowed = routeDomain.hosts.some(
+          (d) => hostname === d || hostname.endsWith(`.${d}`)
+        );
+        if (!isAllowed) {
+          logParse(
+            "failed",
+            400,
+            Date.now() - startTime,
+            `域名(${hostname})不属于${routeDomain.name}平台`
+          );
+          logger.warn(
+            `平台域名不匹配: route=${routeName} host=${hostname} url=${sanitizedUrl.substring(0, 100)}`
+          );
+          return Response.json(
+            errorResponse(`该链接（${hostname}）不属于${routeDomain.name}平台，已拒绝解析，请粘贴正确的${routeDomain.name}分享链接`, 400),
+            {
+              status: safeStatus(400),
+              headers
+            }
+          );
+        }
+      } catch {
+        // URL 已通过 isValidUrl/sanitizeUrl，这里解析失败属异常，按拒绝处理
+        return Response.json(
+          errorResponse("无效的URL格式", 400),
+          {
+            status: safeStatus(400),
+            headers
+          }
+        );
+      }
+    }
+
+    // 解析类接口强制微信认证（登录才能解析）：
+    // 读取 SDK 写入的 wxauth-token Cookie → 远程校验（10 分钟缓存）→ 未认证 401。
+    // 豁免：非解析类接口（health/stats/image/engines 等原生路由不经本中间件）、
+    // VITEST 测试环境。
+    if (process.env.VITEST !== "true" && AUTH_REQUIRED_ROUTES.has(routeName)) {
+      const access = await enforceParseAccess(request);
+      if (!access.allowed) {
+        logParse("failed", access.status, Date.now() - startTime, "未完成微信认证");
+        logger.warn(
+          `未认证解析被拒绝: route=${routeName} ip=${clientIP} url=${sanitizedUrl.substring(0, 100)}`
+        );
+        return Response.json(
+          errorResponse(access.message, access.status),
+          {
+            status: safeStatus(access.status),
+            headers
+          }
+        );
+      }
+    }
+
+    // 统一入口的共享结果缓存：放在认证之后（未认证用户不消费缓存）。
+    // 命中先探测主直链，明确死链（签名过期）视为未命中走重新解析，
+    // 命中先探测主直链，明确死链（签名过期）视为未命中走重新解析，
+    // 避免把过期直链发给前端黑屏
+    if (sharedCache) {
+      const cachedResult = await getResultCache(sanitizedUrl);
+      if (cachedResult) {
+        const stale = await resultStale(cachedResult);
+        if (!stale) {
+          logParse("cache-hit", 200, Date.now() - startTime);
+          // HTTP 状态固定 200（body.code 承载业务码）：新鲜解析路径对失败结果
+          // 也返回 HTTP 200（见下方 Response.json(result, { headers })），
+          // 命中已删除等永久失败缓存条目时须与之一致
+          return Response.json(cachedResult, {
+            status: 200,
+            headers,
+          });
+        }
+        logParse("cache-stale", 200, Date.now() - startTime, "缓存直链已失效，重新解析");
+      }
+    }
+
+    if (shouldCache) {
+      const cached = getCachedResponse(sanitizedUrl);
+      if (cached) {
+        const duration = Date.now() - startTime;
+        logParse("cached", 200, duration);
+        return Response.json(cached, {
+          headers,
+        });
+      }
+    }
+
+    // 计费/配额门禁已全部下线（2026-09-23 移除积分计费）：认证之后直接解析，
+    // 不做任何次数或余额校验。历史上这里先后有过「登录免费配额 + 广告解锁」与
+    // 「每次解析扣 1 积分」两版门禁，均已移除；缓存命中与真实解析一视同仁。
+    try {
+      logger.log(`Parsing URL: ${sanitizedUrl.substring(0, 80)}...`);
+      const rawResult = await parseFunction(sanitizedUrl);
+
+      if (!rawResult) {
+        const duration = Date.now() - startTime;
+        logParse("failed", 400, duration, "解析失败（无返回结果）");
+        logger.warn(`Parse failed after ${duration}ms for URL: ${sanitizedUrl.substring(0, 80)}`);
+        // 失败也记录：便于发现未支持/失效的平台与链接。
+        // recordParse 只入内存缓冲（analytics 内部攒批刷写），无 DB I/O，
+        // 无须 await（Docker 常驻进程，响应返回后缓冲照常刷写）。
+        recordParse({
+          platform: String(routeMatch?.[1] || ""),
+          url: sanitizedUrl,
+          ip: clientIP,
+          status: "failed",
+          reason: "解析失败（无返回结果）",
+        });
+        return Response.json(
+          parseErrorResponse("解析失败"),
+          {
+            status: safeStatus(400),
+            headers
+          }
+        );
+      }
+
+      // 统一响应模型：成功结果在出口统一归一化（code=200 + data 统一字段契约）
+      const result = normalizeResult(rawResult);
+
+      // 解析结果（成功/失败）记录行为分析（analytics 内部攒批异步刷写）
+      if (result?.code === 200) {
+        recordParse({
+          platform: String(result.platform || routeMatch?.[1] || ""),
+          url: sanitizedUrl,
+          ip: clientIP,
+          status: "success",
+        });
+        logParse("success", 200, Date.now() - startTime);
+      } else {
+        recordParse({
+          platform: String(result?.platform || routeMatch?.[1] || ""),
+          url: sanitizedUrl,
+          ip: clientIP,
+          status: "failed",
+          reason: String(result?.msg || "解析失败"),
+        });
+        logParse(
+          "failed",
+          Number(result?.code || 0),
+          Date.now() - startTime,
+          String(result?.msg || "")
+        );
+      }
+
+      if (shouldCache) {
+        setCacheResponse(sanitizedUrl, result);
+      }
+
+      // 共享结果缓存：写入最终归一化结果（含 platform），好友/他人再打开同一
+      // 分享链接时 24h 内直接命中，不再全量重新解析
+      if (sharedCache) {
+        await putResultCache(sanitizedUrl, result);
+      }
+
+      return Response.json(result, {
+        headers,
+      });
+    } catch (error: unknown) {
+      const duration = Date.now() - startTime;
+      const errMsg = error instanceof Error ? error.message : "Unknown error";
+      logParse("error", 500, duration, errMsg);
+      logger.error(`API error after ${duration}ms:`, errMsg);
+      recordParse({
+        platform: String(routeMatch?.[1] || ""),
+        url: sanitizedUrl,
+        ip: clientIP,
+        status: "failed",
+        reason: errMsg,
+      });
+      return Response.json(
+        serverErrorResponse(error),
+        {
+          status: safeStatus(500),
+          headers
+        }
+      );
+    }
+  };
+};
